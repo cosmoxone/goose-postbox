@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+"""postbox-ctl —— goose-postbox 统一管理入口
+
+命令：
+  install [--no-ext]              安装插件到 ~/.agents/plugins/postbox + 合并扩展配置
+  update  [--no-ext]              用当前源码树更新已安装文件（config 保留，幂等）
+  uninstall [--purge]             卸载插件并移除扩展配置（--purge 连数据目录一并删除）
+  pause                           急停：hook 静默直通、send/inject 拒绝、新会话不加载扩展
+  resume                          恢复运行
+  status                          安装/配置/急停/会话/数据 概览
+  log [--file runtime|hooks] [--tail N]   查看日志（默认 runtime 最近 20 行）
+  purge-data [--yes]              清空收件箱/注册表/限流计数（保留安装与配置）
+
+零依赖（python3 标准库）。配置修改前自动备份；所有操作幂等。
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+SRC = os.path.dirname(os.path.abspath(__file__))
+PLUGIN_DIR = os.path.expanduser("~/.agents/plugins/postbox")
+CONFIG = os.path.expanduser("~/.config/goose/config.yaml")
+BASE = os.path.expanduser("~/.local/share/goose/postbox")
+
+CONFIG_ENTRY = (
+    "  postbox:\n"
+    "    name: postbox\n"
+    "    cmd: python3\n"
+    "    args:\n"
+    f"    - {PLUGIN_DIR}/ext/postbox_server.py\n"
+    "    enabled: true\n"
+    "    envs: {}\n"
+    "    type: stdio\n"
+    "    timeout: 300\n"
+)
+
+
+def say(*a) -> None:
+    print(*a, flush=True)
+
+
+def backup_config() -> str | None:
+    if os.path.exists(CONFIG):
+        bak = f"{CONFIG}.bak-{int(time.time())}"
+        shutil.copy2(CONFIG, bak)
+        return bak
+    return None
+
+
+def read_config() -> str:
+    if os.path.exists(CONFIG):
+        with open(CONFIG, encoding="utf-8") as f:
+            return f.read()
+    return ""
+
+
+def config_block_range(text: str) -> tuple[int, int] | None:
+    """postbox 条目在 extensions: 下的行区间 [start, end)（含子行）。"""
+    m = re.search(r"^  postbox:[ \t]*$", text, re.M)
+    if not m:
+        return None
+    lines = text.splitlines(keepends=True)
+    start = text[:m.start()].count("\n")
+    end = start + 1
+    while end < len(lines):
+        line = lines[end]
+        if re.match(r"^\S", line) or re.match(r"^  \S", line):
+            break
+        end += 1
+    # 吃掉块前的一个空行（若删除）
+    return start, end
+
+
+def config_has_entry() -> bool:
+    return config_block_range(read_config()) is not None
+
+
+def config_entry_enabled() -> str:
+    rng = config_block_range(read_config())
+    if rng is None:
+        return "absent"
+    block = "".join(read_config().splitlines(keepends=True)[rng[0]:rng[1]])
+    if re.search(r"enabled:[ \t]*false", block):
+        return "false"
+    return "true"
+
+
+def config_add_entry() -> None:
+    text = read_config()
+    if config_block_range(text):
+        say("    已存在 postbox 扩展条目，跳过（幂等）")
+        return
+    backup_config()
+    m = re.search(r"^extensions:[ \t]*$", text, re.M)
+    if m:
+        text = text[:m.end()] + "\n" + CONFIG_ENTRY + text[m.end():]
+    else:
+        text = text.rstrip("\n") + "\n\nextensions:\n" + CONFIG_ENTRY
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)  # 全新环境（无 goose 配置目录）不崩
+    with open(CONFIG, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def config_remove_entry() -> None:
+    text = read_config()
+    rng = config_block_range(text)
+    if rng is None:
+        say("    config.yaml 中无 postbox 条目")
+        return
+    backup_config()
+    lines = text.splitlines(keepends=True)
+    del lines[rng[0]:rng[1]]
+    if rng[0] > 0 and lines and lines[rng[0] - 1].strip() == "" and \
+            rng[0] < len(lines) and lines[rng[0]].strip() == "":
+        del lines[rng[0]]  # 防双空行
+    with open(CONFIG, "w", encoding="utf-8") as f:
+        f.write("".join(lines))
+
+
+def config_remove_plugins_entry() -> None:
+    """清理 goose 自动登记的 plugins: 段中的 postbox 路径键（卸载时防悬空引用）；
+    若 plugins: 段因此为空则连段头一起删。"""
+    text = read_config()
+    key_line = f"  {PLUGIN_DIR}:"
+    m = re.search(rf"^{re.escape(key_line)}[ \t]*$", text, re.M)
+    if not m:
+        return
+    backup_config()
+    lines = text.splitlines(keepends=True)
+    start = text[:m.start()].count("\n")
+    end = start + 1
+    while end < len(lines) and not (re.match(r"^\S", lines[end]) or re.match(r"^  \S", lines[end])):
+        end += 1
+    del lines[start:end]
+    # plugins: 段头是否已无子键
+    pi = start - 1
+    while pi >= 0 and lines[pi].strip() == "":
+        pi -= 1
+    if pi >= 0 and lines[pi].rstrip() == "plugins:":
+        j = pi + 1
+        while j < len(lines) and lines[j].strip() == "":
+            j += 1
+        if j >= len(lines) or re.match(r"^\S", lines[j]):
+            del lines[pi]  # 空段头删除（其后空行无害）
+    with open(CONFIG, "w", encoding="utf-8") as f:
+        f.write("".join(lines))
+    say("    已清理 goose plugins: 段中的 postbox 登记")
+
+
+def config_set_enabled(val: bool) -> None:
+    text = read_config()
+    rng = config_block_range(text)
+    if rng is None:
+        say(f"    [!] config.yaml 无 postbox 条目，无法置 enabled={val}")
+        return
+    backup_config()
+    lines = text.splitlines(keepends=True)
+    for i in range(rng[0], rng[1]):
+        lines[i] = re.sub(r"enabled:[ \t]*(true|false)", f"enabled: {str(val).lower()}", lines[i])
+    with open(CONFIG, "w", encoding="utf-8") as f:
+        f.write("".join(lines))
+
+
+def copy_plugin_files() -> None:
+    os.makedirs(os.path.dirname(PLUGIN_DIR), exist_ok=True)
+    shutil.rmtree(PLUGIN_DIR, ignore_errors=True)
+    os.makedirs(PLUGIN_DIR, exist_ok=True)  # 文件条目的父目录（rmtree 后必须重建）
+    for item in ("plugin.json", "postbox-ctl", "hooks", "scripts", "ext", "tests"):
+        s = os.path.join(SRC, item)
+        if os.path.exists(s):
+            shutil.copytree(s, os.path.join(PLUGIN_DIR, item),
+                            ignore=shutil.ignore_patterns("__pycache__")) \
+                if os.path.isdir(s) else shutil.copy2(s, os.path.join(PLUGIN_DIR, item))
+    hook = os.path.join(PLUGIN_DIR, "scripts", "postbox_hook.py")
+    os.path.exists(hook) and os.chmod(hook, 0o755)
+    ctl = os.path.join(PLUGIN_DIR, "postbox-ctl")  # pb 管理命令随插件安装（v0.8.0 曾漏装）
+    os.path.exists(ctl) and os.chmod(ctl, 0o755)
+
+
+def plugin_version(where: str) -> str:
+    try:
+        with open(os.path.join(where, "plugin.json"), encoding="utf-8") as f:
+            return json.load(f).get("version", "?")
+    except (OSError, ValueError):
+        return "?"
+
+
+def dir_stats(path: str) -> tuple[int, int]:
+    files = size = 0
+    for root, _, names in os.walk(path):
+        for n in names:
+            files += 1
+            try:
+                size += os.path.getsize(os.path.join(root, n))
+            except OSError:
+                pass
+    return files, size
+
+
+def human(n: int) -> str:
+    return f"{n/1024:.0f}K" if n < 1024 * 1024 else f"{n/1024/1024:.1f}M"
+
+
+# ------------------------------------------------------------------ 命令
+
+def cmd_install(args: list[str]) -> int:
+    say("==> 安装插件")
+    copy_plugin_files()
+    say(f"    {PLUGIN_DIR}  v{plugin_version(PLUGIN_DIR)}")
+    if "--no-ext" not in args:
+        say("==> 配置 MCP 扩展")
+        config_add_entry()
+        say("    生效范围：之后新开的 goose 会话")
+    say("==> 完成。快速验证：新开会话说『用 postbox_list 列出会话』")
+    return 0
+
+
+def cmd_update(args: list[str]) -> int:
+    if os.path.realpath(SRC) == os.path.realpath(PLUGIN_DIR):
+        say("[!] 你在已安装目录里运行 update——请在源码/克隆目录执行（git 用户先 git pull）")
+        return 1
+    old = plugin_version(PLUGIN_DIR)
+    say("==> 更新文件")
+    copy_plugin_files()
+    new = plugin_version(PLUGIN_DIR)
+    say(f"    v{old} -> v{new}")
+    if "--no-ext" not in args:
+        config_add_entry()  # 幂等：缺失才补
+    say("==> 完成。运行中的旧会话不受影响，新会话用新版本。")
+    return 0
+
+
+def cmd_uninstall(args: list[str]) -> int:
+    say("==> 移除扩展配置")
+    config_remove_entry()
+    config_remove_plugins_entry()
+    say("==> 删除插件")
+    shutil.rmtree(PLUGIN_DIR, ignore_errors=True)
+    say(f"    {PLUGIN_DIR} 已删除")
+    if "--purge" in args:
+        shutil.rmtree(BASE, ignore_errors=True)
+        say(f"==> 数据目录已删除：{BASE}")
+    else:
+        say(f"==> 数据保留在 {BASE}（彻底清除：postbox-ctl uninstall --purge）")
+    say("    注意：运行中的会话仍持有已加载的扩展，结束后即完全移除。")
+    return 0
+
+
+def cmd_pause(_args: list[str]) -> int:
+    os.makedirs(BASE, exist_ok=True)
+    flag = os.path.join(BASE, "DISABLED")
+    open(flag, "w").write(f"paused {time.strftime('%F %T')}\n")
+    config_set_enabled(False)
+    with open(os.path.join(BASE, "runtime.log"), "a", encoding="utf-8") as f:
+        f.write(f"{time.strftime('%F %T')} ctl-pause\n")
+    say("==> 已急停：")
+    say("    · hook 事件静默直通（不再注册/心跳/注入）")
+    say("    · send 立即报错『postbox 已暂停』；注入停止")
+    say("    · 新会话不加载 postbox 扩展（enabled: false）")
+    say("    · 收件箱数据保留；恢复：postbox-ctl resume")
+    return 0
+
+
+def cmd_resume(_args: list[str]) -> int:
+    flag = os.path.join(BASE, "DISABLED")
+    os.path.exists(flag) and os.remove(flag)
+    config_set_enabled(True)
+    with open(os.path.join(BASE, "runtime.log"), "a", encoding="utf-8") as f:
+        f.write(f"{time.strftime('%F %T')} ctl-resume\n")
+    say("==> 已恢复：新会话重新加载扩展，hook 恢复注册/注入。")
+    return 0
+
+
+def cmd_status(_args: list[str]) -> int:
+    installed = os.path.isdir(PLUGIN_DIR)
+    say(f"安装     : {'v' + plugin_version(PLUGIN_DIR) if installed else '未安装'}  ({PLUGIN_DIR})")
+    say(f"扩展配置 : {config_entry_enabled()}  ({CONFIG})")
+    disabled = os.path.exists(os.path.join(BASE, "DISABLED"))
+    say(f"急停状态 : {'⏸ 已暂停（resume 恢复）' if disabled else '运行中'}")
+    if installed:
+        try:
+            sys.path.insert(0, os.path.join(PLUGIN_DIR, "scripts"))
+            import postbox_store as st  # noqa
+            rows = st.list_sessions()
+            say(f"注册会话 : {len(rows)} 个")
+            for r in rows[:8]:
+                mark = "忙" if r["busy"] else "闲"
+                alive = "活" if r["alive"] else "死"
+                say(f"    {r['name'] or r['id']:24} {r['id']} {mark}/{alive} 未读{r['unread']}"
+                    + ("  <- 本会话" if r["is_self"] else ""))
+        except Exception as e:  # noqa: BLE001
+            say(f"注册会话 : 读取失败 ({e})")
+    if os.path.isdir(BASE):
+        inb_files, inb_size = dir_stats(os.path.join(BASE, "inbox"))
+        say(f"收件箱   : {inb_files} 个文件 / {human(inb_size)}")
+        for lg in ("runtime.log", "hooks.log"):
+            p = os.path.join(BASE, lg)
+            if os.path.exists(p):
+                say(f"日志     : {lg} {human(os.path.getsize(p))}  （postbox-ctl log --file {lg.split('.')[0]}）")
+    else:
+        say(f"数据目录 : 不存在（{BASE}）")
+    return 0
+
+
+def cmd_log(args: list[str]) -> int:
+    which = "runtime"
+    tail_n = 20
+    it = iter(args)
+    for a in it:
+        if a == "--file":
+            which = next(it, "runtime")
+        elif a == "--tail":
+            tail_n = int(next(it, "20"))
+    path = os.path.join(BASE, "runtime.log" if which != "hooks" else "hooks.log")
+    if not os.path.exists(path):
+        say(f"(无日志文件 {path})")
+        return 0
+    with open(path, encoding="utf-8", errors="replace") as f:
+        lines = f.readlines()
+    for line in lines[-tail_n:]:
+        say(line.rstrip())
+    return 0
+
+
+def cmd_purge_data(args: list[str]) -> int:
+    if "--yes" not in args:
+        say("将清空 sessions/ inbox/ limits/ runtime.log（收件箱消息将丢失！）")
+        say("确认请执行：postbox-ctl purge-data --yes")
+        return 1
+    disabled = os.path.exists(os.path.join(BASE, "DISABLED"))
+    shutil.rmtree(BASE, ignore_errors=True)
+    os.makedirs(BASE, exist_ok=True)
+    if disabled:  # 保持急停语义
+        open(os.path.join(BASE, "DISABLED"), "w").write("paused (purge-data kept)\n")
+    say(f"==> 已清空数据：{BASE}")
+    return 0
+
+
+def cmd_mdns(args: list[str]) -> int:
+    """mdns start [--name X] / stop / list —— M5c 自动发现的托管入口"""
+    md = os.path.join(PLUGIN_DIR, "scripts", "postbox_mdns.py")
+    pidf = os.path.join(BASE, "mdns", "serve.pid")
+    if not args:
+        say("用法: postbox-ctl mdns start [--name 别名] | stop | list"); return 1
+    sub = args[0]
+    if sub == "start":
+        if os.path.exists(pidf) and os.path.exists(f"/proc/{open(pidf).read().strip()}"):
+            say("已在运行"); return 0
+        name = args[args.index("--name") + 1] if "--name" in args else ""
+        extra = f"--name {name}" if name else ""
+        os.makedirs(os.path.dirname(pidf), exist_ok=True)
+        with open(os.path.join(BASE, "mdns", "serve.log"), "ab") as lg:
+            p = subprocess.Popen([sys.executable, md, "serve"] + (extra.split() if extra else []),
+                                 stdout=lg, stderr=lg, start_new_session=True)
+        open(pidf, "w").write(str(p.pid))
+        say(f"mdns 已后台启动 pid={p.pid}（发现结果：postbox-ctl mdns list）")
+        return 0
+    if sub == "stop":
+        if os.path.exists(pidf):
+            pid = int(open(pidf).read().strip())
+            try:
+                os.kill(pid, 15); say(f"已停止 pid={pid}")
+            except OSError:
+                say("进程不存在")
+            os.remove(pidf)
+        else:
+            say("未在运行")
+        return 0
+    if sub == "list":
+        return subprocess.call([sys.executable, md, "list"])
+    say(f"未知子命令 {sub}"); return 1
+
+
+def cmd_watch(args: list[str]) -> int:
+    """watch <peer别名> <远端日志路径> [--stall 秒=300] [--interval 秒=30] [--alert 本机会话名]
+    监控对端任务日志：停滞(日志龄>stall)或对端不可达 → 打印+可选 postbox 告警。Ctrl-C 退出。"""
+    pos = [a for a in args if not a.startswith("--")]
+    if len(pos) < 2:
+        say("用法: postbox-ctl watch <peer> <log> [--stall 300] [--interval 30] [--alert ops]"); return 1
+    peer, log = pos[0], pos[1]
+    kw = dict(zip(args[::2] if False else [], []))
+    def opt(k, d):
+        return args[args.index(k) + 1] if k in args else d
+    stall, interval, alert = int(opt("--stall", "300")), int(opt("--interval", "30")), opt("--alert", "")
+    sys.path.insert(0, os.path.join(PLUGIN_DIR, "scripts"))
+    import postbox_store as st  # noqa
+    host = st.load_peers_union().get(peer, {}).get("host")
+    if not host:
+        say(f"未知 peer {peer}（含 mDNS 发现；先 postbox-ctl mdns list）"); return 1
+    say(f"watch {peer} ({host}) log={log} stall={stall}s interval={interval}s"
+        + (f" alert={alert}" if alert else ""))
+    state, last_alert = "init", 0.0
+    while True:
+        r = st._ssh_json(host, {"action": "probe", "log": log}, timeout=20)
+        age = r.get("log_mtime_age")
+        if not r.get("ok"):
+            cur = "unreachable"
+        elif age is None:
+            cur = "no-log"
+        elif age > stall:
+            cur = "stalled"
+        else:
+            cur = "ok"
+        if cur != state or (cur in ("stalled", "unreachable", "no-log") and time.time() - last_alert > 600):
+            ts = time.strftime("%H:%M:%S")
+            say(f"[{ts}] 状态: {cur}" + (f" 日志龄={age}s" if isinstance(age, int) else ""))
+            if cur != "ok" and alert:
+                try:
+                    st.send_to(alert, "watchdog", "watchdog",
+                               f"[alert] task=watch peer={peer} state={cur} "
+                               f"log_age={age if isinstance(age, int) else -1}s 请人工检查")
+                    say(f"    已发告警 → {alert}")
+                except st.PostboxError as e:
+                    say(f"    告警失败: {e}")
+            state, last_alert = cur, time.time()
+        time.sleep(interval)
+
+
+def cmd_tasks(_args: list[str]) -> int:
+    """tasks —— 聚合展示收件箱中的契约消息（[task]/[progress]/[steer]/[done]/[fail]）"""
+    sys.path.insert(0, os.path.join(PLUGIN_DIR, "scripts"))
+    import postbox_store as st  # noqa
+    data = st.task_updates()
+    if not data:
+        say("(无契约消息；发送时使用 [progress] task=x … 约定头即可聚合于此)")
+        return 0
+    for task, info in data.items():
+        last = info["events"][-1]
+        say(f"● task={task:16} 最新: [{last['kind']}] {last['ts']} 来自 {last['from']}")
+        for e in info["events"][-3:-1]:
+            say(f"    {e['ts'][11:19]} [{e['kind']:8}] {' '.join(f'{k}={v}' for k, v in e['fields'].items())[:60]}")
+    return 0
+
+
+def cmd_join(args: list[str]) -> int:
+    """join <hub_url> <join_key> [节点名] —— 一键注册并写 config（MT-0.5）"""
+    import urllib.request
+    if len(args) < 2:
+        say("用法: postbox-ctl join <hub_url> <join_key> [节点名（默认本机 hostname 短名）]")
+        return 1
+    url, jk = args[0].rstrip("/"), args[1]
+    node = args[2] if len(args) > 2 else (os.uname().nodename.split(".")[0][:24] or "node")
+    req = urllib.request.Request(url + "/join",
+                                 data=json.dumps({"join_key": jk, "node": node}).encode(),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            out = json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        say(f"注册失败: {json.loads(e.read() or b'{}').get('error', e.code)}")
+        return 1
+    if not out.get("ok"):
+        say(f"注册失败: {out.get('error', '未知')}")
+        return 1
+    try:
+        pbcfg = os.path.join(BASE, "config.json")
+        d = json.load(open(pbcfg)) if os.path.exists(pbcfg) else {}
+    except ValueError:  # 空/损坏文件容错（首装前常见）
+        d = {}
+    d["relay"] = {"url": url, "token": out["token"]}
+    os.makedirs(BASE, exist_ok=True)
+    json.dump(d, open(pbcfg, "w"), ensure_ascii=False, indent=1)
+    say(f"==> 已注册节点 {out['node']}（域 {out.get('domain')}）并接入 {url}")
+    say(f"    Console: {url}/console?token={out['token']}")
+    say("    试试：用 postbox_send 给 同事名@relay 发消息：hi")
+    return 0
+
+
+COMMANDS = {"install": cmd_install, "update": cmd_update, "uninstall": cmd_uninstall,
+            "pause": cmd_pause, "resume": cmd_resume, "status": cmd_status,
+            "log": cmd_log, "purge-data": cmd_purge_data,
+            "mdns": cmd_mdns, "watch": cmd_watch, "tasks": cmd_tasks, "join": cmd_join}
+
+
+def main() -> int:
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        say(__doc__)
+        return 0
+    cmd = sys.argv[1]
+    if cmd not in COMMANDS:
+        say(f"未知命令: {cmd}\n")
+        say(__doc__)
+        return 1
+    return COMMANDS[cmd](sys.argv[2:])
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:  # 输出被 head/less 截断属正常退出
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)
