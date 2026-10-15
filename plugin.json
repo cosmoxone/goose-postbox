@@ -1,0 +1,5 @@
+{
+  "name": "postbox",
+  "version": "0.8.2",
+  "description": "sessions-msg: cross-session messaging + execution dispatch for goose (local + cross-machine; fleetd/nf backends, load-aware)"
+}
